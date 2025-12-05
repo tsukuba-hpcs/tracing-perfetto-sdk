@@ -2,6 +2,8 @@
 use std::sync::atomic;
 use std::{borrow, env, marker, mem, process, sync, thread, time};
 
+#[cfg(feature = "fulgurt")]
+use fulgurt_core::task as fulgurt_task;
 use prost::encoding;
 #[cfg(feature = "tokio")]
 use tokio::task;
@@ -76,6 +78,12 @@ where
     thread_tracks_sent: dashmap::DashSet<usize>,
     #[cfg(feature = "tokio")]
     task_tracks_sent: dashmap::DashSet<task::Id>,
+    #[cfg(feature = "fulgurt")]
+    fulgurt_descriptor_sent: atomic::AtomicBool,
+    #[cfg(feature = "fulgurt")]
+    fulgurt_track_uuid: ids::TrackUuid,
+    #[cfg(feature = "fulgurt")]
+    fulgurt_task_tracks_sent: dashmap::DashSet<(usize, usize)>, // (thread_id, task_id)
 }
 
 // Does not contain DebugAnnotations; they are shipped separately as a span
@@ -118,7 +126,11 @@ where
 
     fn build(builder: Builder<'_, W>) -> error::Result<Self> {
         // Shared global initialization for all layers
-        init::global_init(builder.name, builder.enable_in_process, builder.enable_system);
+        init::global_init(
+            builder.name,
+            builder.enable_in_process,
+            builder.enable_system,
+        );
 
         let writer = sync::Arc::new(builder.writer);
 
@@ -166,6 +178,12 @@ where
         let thread_tracks_sent = dashmap::DashSet::new();
         #[cfg(feature = "tokio")]
         let task_tracks_sent = dashmap::DashSet::new();
+        #[cfg(feature = "fulgurt")]
+        let fulgurt_descriptor_sent = atomic::AtomicBool::new(false);
+        #[cfg(feature = "fulgurt")]
+        let fulgurt_track_uuid = ids::TrackUuid::for_fulgurt();
+        #[cfg(feature = "fulgurt")]
+        let fulgurt_task_tracks_sent = dashmap::DashSet::new();
 
         let inner = sync::Arc::new(Inner {
             #[cfg(feature = "sdk")]
@@ -187,6 +205,12 @@ where
             thread_tracks_sent,
             #[cfg(feature = "tokio")]
             task_tracks_sent,
+            #[cfg(feature = "fulgurt")]
+            fulgurt_descriptor_sent,
+            #[cfg(feature = "fulgurt")]
+            fulgurt_track_uuid,
+            #[cfg(feature = "fulgurt")]
+            fulgurt_task_tracks_sent,
         });
 
         Ok(Self { inner })
@@ -211,6 +235,13 @@ where
                         return res;
                     }
 
+                    #[cfg(feature = "fulgurt")]
+                    if let Some(res) =
+                        self.fulgurt_trace_track_sequence(self.inner.process_track_uuid)
+                    {
+                        return res;
+                    }
+
                     let tid = thread_id();
                     let track_uuid = if self.inner.create_async_tracks.is_some() {
                         ids::TrackUuid::for_thread(tid)
@@ -227,6 +258,11 @@ where
         } else {
             #[cfg(feature = "tokio")]
             if let Some(res) = self.tokio_trace_track_sequence(self.inner.tokio_track_uuid) {
+                return res;
+            }
+
+            #[cfg(feature = "fulgurt")]
+            if let Some(res) = self.fulgurt_trace_track_sequence(self.inner.fulgurt_track_uuid) {
                 return res;
             }
 
@@ -256,6 +292,20 @@ where
             ids::SequenceId::for_task(id),
             flavor::Flavor::Async,
         ))
+    }
+
+    #[cfg(feature = "fulgurt")]
+    fn fulgurt_trace_track_sequence(
+        &self,
+        _default_track: ids::TrackUuid,
+    ) -> Option<(ids::TrackUuid, ids::SequenceId, flavor::Flavor)> {
+        let task_id = fulgurt_task::try_id()?;
+        let tid = thread_id();
+        // Always use thread+task combination for unique tracks per thread-task pair
+        let track_uuid = ids::TrackUuid::for_fulgurt_thread_task(tid, task_id);
+        let sequence_id = ids::SequenceId::for_fulgurt_thread_task(tid, task_id);
+
+        Some((track_uuid, sequence_id, flavor::Flavor::Async))
     }
 
     /// Flush internal buffers, making the best effort for all pending writes to
@@ -381,6 +431,12 @@ where
         } else {
             self.ensure_tokio_runtime_known(meta);
         }
+        #[cfg(feature = "fulgurt")]
+        if let Some(ref name) = self.inner.create_async_tracks {
+            self.ensure_fulgurt_task_track_known(meta, name);
+        } else {
+            self.ensure_fulgurt_runtime_known(meta);
+        }
     }
 
     fn ensure_process_known(&self, meta: &tracing::Metadata) {
@@ -406,16 +462,20 @@ where
     }
 
     fn ensure_thread_known(&self, meta: &tracing::Metadata) {
-        let thread_id = thread_id();
-        if self.inner.thread_tracks_sent.insert(thread_id) {
+        let tid = thread_id();
+        if self.inner.thread_tracks_sent.insert(tid) {
             let thread_name = thread::current()
                 .name()
                 .map(|s| s.to_owned())
-                .unwrap_or_else(|| format!("(unnamed thread {thread_id})"));
+                .unwrap_or_else(|| format!("(unnamed thread)"));
             let packet = if let Some(ref name) = self.inner.create_async_tracks {
-                self.create_thread_track_descriptor(thread_id, name.to_owned(), false)
+                self.create_thread_track_descriptor(tid, format!("{}-thread{}", name, tid), false)
             } else {
-                self.create_thread_track_descriptor(thread_id, thread_name, true)
+                self.create_thread_track_descriptor(
+                    tid,
+                    format!("{} (tid={})", thread_name, tid),
+                    true,
+                )
             };
             self.write_packet(meta, packet);
         }
@@ -438,6 +498,31 @@ where
         if let Some(task_id) = task::try_id() {
             if self.inner.task_tracks_sent.insert(task_id) {
                 let packet = self.create_task_track_descriptor(task_id, name.to_owned());
+                self.write_packet(meta, packet);
+            }
+        }
+    }
+
+    #[cfg(feature = "fulgurt")]
+    fn ensure_fulgurt_runtime_known(&self, meta: &tracing::Metadata) {
+        let fulgurt_descriptor_sent = self
+            .inner
+            .fulgurt_descriptor_sent
+            .fetch_or(true, atomic::Ordering::Relaxed);
+        if !fulgurt_descriptor_sent {
+            let packet = self.create_fulgurt_runtime_track_descriptor();
+            self.write_packet(meta, packet);
+        }
+    }
+
+    #[cfg(feature = "fulgurt")]
+    fn ensure_fulgurt_task_track_known(&self, meta: &tracing::Metadata, name: &str) {
+        if let Some(task_id) = fulgurt_task::try_id() {
+            let tid = thread_id();
+            let key = (tid, task_id.as_usize());
+            if self.inner.fulgurt_task_tracks_sent.insert(key) {
+                let packet =
+                    self.create_fulgurt_task_track_descriptor(tid, task_id, name.to_owned());
                 self.write_packet(meta, packet);
             }
         }
@@ -556,6 +641,59 @@ where
                     uuid: Some(ids::TrackUuid::for_task(task_id).as_raw()),
                     static_or_dynamic_name: Some(track_descriptor::StaticOrDynamicName::Name(
                         name.to_owned(),
+                    )),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "fulgurt")]
+    #[must_use]
+    fn create_fulgurt_runtime_track_descriptor(&self) -> schema::TracePacket {
+        const FULGURT_THREAD_ID: usize = (i32::MAX - 2) as usize;
+        schema::TracePacket {
+            data: Some(trace_packet::Data::TrackDescriptor(
+                schema::TrackDescriptor {
+                    parent_uuid: Some(self.inner.process_track_uuid.as_raw()),
+                    uuid: Some(self.inner.fulgurt_track_uuid.as_raw()),
+                    thread: Some(schema::ThreadDescriptor {
+                        pid: Some(process::id() as i32),
+                        tid: Some(FULGURT_THREAD_ID as i32),
+                        thread_name: Some("fulgurt-runtime".to_owned()),
+                        ..Default::default()
+                    }),
+                    static_or_dynamic_name: Some(track_descriptor::StaticOrDynamicName::Name(
+                        "fulgurt-runtime".to_owned(),
+                    )),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "fulgurt")]
+    #[must_use]
+    fn create_fulgurt_task_track_descriptor(
+        &self,
+        tid: usize,
+        task_id: fulgurt_task::Id,
+        name: String,
+    ) -> schema::TracePacket {
+        let parent_uuid = if self.inner.force_flavor == Some(flavor::Flavor::Async) {
+            self.inner.process_track_uuid
+        } else {
+            self.inner.fulgurt_track_uuid
+        };
+        schema::TracePacket {
+            data: Some(trace_packet::Data::TrackDescriptor(
+                schema::TrackDescriptor {
+                    parent_uuid: Some(parent_uuid.as_raw()),
+                    uuid: Some(ids::TrackUuid::for_fulgurt_thread_task(tid, task_id).as_raw()),
+                    static_or_dynamic_name: Some(track_descriptor::StaticOrDynamicName::Name(
+                        format!("{}-thread{}-task{}", name, tid, task_id.as_usize()),
                     )),
                     ..Default::default()
                 },
@@ -931,7 +1069,8 @@ where
         }
     }
 
-    /// Set the name for perfetto to producer. This name will have to be specified in a data source.
+    /// Set the name for perfetto to producer. This name will have to be
+    /// specified in a data source.
     pub fn with_name(mut self, name: &'c str) -> Self {
         self.name = name;
         self

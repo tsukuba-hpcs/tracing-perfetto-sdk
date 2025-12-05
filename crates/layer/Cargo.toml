@@ -16,6 +16,7 @@ prost.workspace = true
 thiserror.workspace = true
 thread_local.workspace = true
 tokio = { workspace = true, optional = true }
+fulgurt_core = { path = "../../../fulgurt_core", optional = true }
 tracing.workspace = true
 tracing-perfetto-sdk-schema.workspace = true
 tracing-perfetto-sdk-sys = { workspace = true, optional = true }
@@ -30,6 +31,7 @@ tracing-appender.workspace = true
 [features]
 default = ["sdk"]
 tokio = ["dep:tokio"]
+fulgurt = ["dep:fulgurt_core"]
 serde = ["tracing-perfetto-sdk-schema/serde"]
 sdk = ["dep:tracing-perfetto-sdk-sys"]
 

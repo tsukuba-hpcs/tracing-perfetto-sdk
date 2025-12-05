@@ -2,6 +2,8 @@ use std::hash;
 use std::hash::Hash as _;
 use std::hash::Hasher as _;
 
+#[cfg(feature = "fulgurt")]
+use fulgurt_core::task as fulgurt_task;
 #[cfg(feature = "tokio")]
 use tokio::task;
 
@@ -16,6 +18,12 @@ const TOKIO_NS: u32 = 3;
 #[cfg(feature = "tokio")]
 const TASK_NS: u32 = 4;
 const COUNTER_NS: u32 = 5;
+#[cfg(feature = "fulgurt")]
+const FULGURT_NS: u32 = 6;
+#[cfg(feature = "fulgurt")]
+const FULGURT_TASK_NS: u32 = 7;
+#[cfg(feature = "fulgurt")]
+const FULGURT_THREAD_TASK_NS: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -52,6 +60,33 @@ impl TrackUuid {
         TrackUuid(h.finish())
     }
 
+    #[cfg(feature = "fulgurt")]
+    pub fn for_fulgurt() -> TrackUuid {
+        let mut h = hash::DefaultHasher::new();
+        (TRACK_UUID_NS, FULGURT_NS).hash(&mut h);
+        TrackUuid(h.finish())
+    }
+
+    #[cfg(feature = "fulgurt")]
+    pub fn for_fulgurt_task(id: fulgurt_task::Id) -> TrackUuid {
+        let mut h = hash::DefaultHasher::new();
+        (TRACK_UUID_NS, FULGURT_TASK_NS, id.as_usize()).hash(&mut h);
+        TrackUuid(h.finish())
+    }
+
+    #[cfg(feature = "fulgurt")]
+    pub fn for_fulgurt_thread_task(tid: usize, task_id: fulgurt_task::Id) -> TrackUuid {
+        let mut h = hash::DefaultHasher::new();
+        (
+            TRACK_UUID_NS,
+            FULGURT_THREAD_TASK_NS,
+            tid,
+            task_id.as_usize(),
+        )
+            .hash(&mut h);
+        TrackUuid(h.finish())
+    }
+
     pub fn for_counter(counter_name: &str) -> TrackUuid {
         let mut h = hash::DefaultHasher::new();
         (TRACK_UUID_NS, COUNTER_NS, counter_name).hash(&mut h);
@@ -74,6 +109,26 @@ impl SequenceId {
     pub fn for_task(id: task::Id) -> SequenceId {
         let mut h = hash::DefaultHasher::new();
         (SEQUENCE_ID_NS, TASK_NS, id).hash(&mut h);
+        SequenceId(h.finish() as u32)
+    }
+
+    #[cfg(feature = "fulgurt")]
+    pub fn for_fulgurt_task(id: fulgurt_task::Id) -> SequenceId {
+        let mut h = hash::DefaultHasher::new();
+        (SEQUENCE_ID_NS, FULGURT_TASK_NS, id.as_usize()).hash(&mut h);
+        SequenceId(h.finish() as u32)
+    }
+
+    #[cfg(feature = "fulgurt")]
+    pub fn for_fulgurt_thread_task(tid: usize, task_id: fulgurt_task::Id) -> SequenceId {
+        let mut h = hash::DefaultHasher::new();
+        (
+            SEQUENCE_ID_NS,
+            FULGURT_THREAD_TASK_NS,
+            tid,
+            task_id.as_usize(),
+        )
+            .hash(&mut h);
         SequenceId(h.finish() as u32)
     }
 
